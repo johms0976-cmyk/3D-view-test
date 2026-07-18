@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FP CAM — Phase 2 test rig</title>
+<style>
+  :root{
+    --mono:"Courier New",monospace;
+    --cream:#f0e7d3; --cream-dim:#b9ae95;
+    --purple:#8a5cf6; --purple-deep:#4b2fa8; --purple-glow:#a985ff;
+    --grass:#2c3a24; --tarmac:#17141b; --heat:#e4573d;
+  }
+  body{margin:0; background:var(--tarmac); color:var(--cream); font-family:system-ui,sans-serif}
+  #topbar{padding:10px 14px; font-weight:800; letter-spacing:2px; text-transform:uppercase;
+          font-size:12px; color:var(--purple-glow)}
+  #trackwrap{position:relative; background:var(--grass); height:min(62vh,520px); overflow:hidden}
+  #btns{display:flex; gap:8px; padding:10px 14px; flex-wrap:wrap; align-items:center}
+  button,select{background:var(--purple-deep); color:#fff; border:2px solid var(--purple);
+         border-radius:10px; padding:8px 14px; font-weight:700; cursor:pointer}
+  button:active{filter:brightness(1.3)}
+  button.hot{background:#7a2418; border-color:var(--heat)}
+  #note{padding:0 14px 16px; font-size:12px; color:var(--cream-dim); line-height:1.5; max-width:680px}
+</style>
+</head>
+<body>
+<div id="topbar">FP CAM · Phase 2 test rig (turn hold · event FX · weather · gravel)</div>
+<div id="trackwrap"></div>
+<div id="btns">
+  <button class="hot" onclick="fullTurn()">▶ Run full turn</button>
+  <button onclick="play(9)">Move 9</button>
+  <button onclick="doSpin()">Spin out</button>
+  <button onclick="doGravel()">Gravel toll</button>
+  <select id="wx" onchange="setWeather(this.value)">
+    <option value="none">Dry</option>
+    <option value="heavy_rain" selected>Heavy Rain</option>
+    <option value="light_rain">Light Rain</option>
+    <option value="mist">Mist</option>
+    <option value="extreme_heat">Extreme Heat</option>
+    <option value="strong_wind">Strong Wind</option>
+    <option value="low_sun">Low Sun</option>
+    <option value="cold">Cold</option>
+  </select>
+  <button onclick="demo=!demo">Auto-demo on/off</button>
+</div>
+<div id="note">
+  <b>Run full turn</b> walks the real hook chain: playerReveal (cockpit pins up while the
+  car is still parked) → move 8 → React boost +3 → Slipstream +2 (tow lines) → corner
+  check paying 2 Heat (red flare, HUD Engine pips drop) → release. Weather sectors cover
+  spaces 18–26; gravel lines spaces 5–6 (inner) and 20 (outer). The HUD plaque up top
+  goes red when your revealed speed beats the next limit. Same file as the game loads —
+  <b>js/fpview.js</b>.
+</div>
+
+<script>
+/* ================= fake game globals (mirrors what game.js exposes) ======= */
+var S = 40, LAYOUT = "loop", LAP_START = 0, LAP_LEN = S;
+var PTS = [];
+(function(){
+  for(let i=0;i<S;i++){
+    const a = i/S*Math.PI*2;
+    const r = 1 + 0.16*Math.sin(a*2);
+    PTS.push({x: 600 + Math.cos(a)*430*r, y: 400 + Math.sin(a)*250*r});
+  }
+  for(let i=0;i<S;i++){
+    const p=PTS[i], q=PTS[(i+1)%S], r2=PTS[(i-1+S)%S];
+    const dx=q.x-r2.x, dy=q.y-r2.y, l=Math.hypot(dx,dy)||1;
+    p.tx=dx/l; p.ty=dy/l; p.nx=dy/l; p.ny=-dx/l;
+  }
+})();
+var TRACK = { spacePts: PTS.map(p=>[p.x,p.y]), imgW:1200, imgH:800,
+              corners:[{at:8,limit:3},{at:22,limit:5},{at:33,limit:2}], tunnels:[{from:12,to:15}] };
+function PT(i){ return PTS[((i%S)+S)%S]; }
+var phys = t => ((t%S)+S)%S;
+function raceDist(){ return S*3; }
+function cornerTotals(){ const o=[]; for(let l=0;l<3;l++) TRACK.corners.forEach(c=>o.push(l*S+c.at)); return o; }
+function cornerIdxOf(ct){ return TRACK.corners.findIndex(c=>c.at===phys(ct)); }
+function limitOfCorner(i){ return TRACK.corners[i].limit; }
+function limitAt(ct){ return limitOfCorner(cornerIdxOf(ct)); }
+function inTunnelSpace(i){ return i>=12 && i<=15; }
+var spotOffOf = s => s===0 ? -9 : 9;
+function carPose(totF, off){
+  const i=Math.floor(totF), f=totF-i;
+  const a=PT(phys(i)), b=PT(phys(i+1));
+  const nx=a.nx+(b.nx-a.nx)*f, ny=a.ny+(b.ny-a.ny)*f;
+  return {x:a.x+(b.x-a.x)*f+nx*off, y:a.y+(b.y-a.y)*f+ny*off, ang:0};
+}
+var REPLAY = { active:false };
+function toast(m){ console.log("toast:", m); }
+function heatCapFor(p){ return 6; }
+function gravelLists(){ return {inner:[5,6], outer:[20]}; }
+function trackHasGravel(){ return true; }
+function onGravel(p){ const i=phys(p.total), g=gravelLists();
+  return (p.spot===0?g.inner:g.outer).includes(i); }
+function isWeatherSector(sec){ return sec===1; }
+
+var you = {id:"you", isBot:false, name:"No. 17 — You", color:"#8a5cf6",
+           total:0, spot:0, gear:3, speed:0, engine:6, limitAdj:0,
+           finished:false, _v:{total:0, off:-9, spin:0}};
+var bots = [
+  {id:"b1", isBot:true, name:"No. 2 Clogger",  color:"#FF6B00", total:4,  spot:1, finished:false, _v:{total:4,  off:9,  spin:0}, pace:1.6},
+  {id:"b2", isBot:true, name:"No. 44 Kereru",  color:"#0076C0", total:8,  spot:0, finished:false, _v:{total:8,  off:-9, spin:0}, pace:2.4},
+  {id:"b3", isBot:true, name:"No. 21 Eagle",   color:"#FF0033", total:14, spot:1, finished:false, _v:{total:14, off:9,  spin:0}, pace:3.1},
+];
+var G = { players:[you].concat(bots), weather:null };
+function curHuman(){ return you; }
+function setWeather(key){
+  const defs = {
+    none:{sector:{}}, heavy_rain:{sector:{aqua:true}}, light_rain:{sector:{cool:1}},
+    mist:{sector:{noSlip:true}}, extreme_heat:{sector:{noCool:true}},
+    strong_wind:{sector:{wind:true}}, low_sun:{sector:{lowSun:true}}, cold:{sector:{cool:1}},
+  };
+  G.weather = key==="none" ? null :
+    { key, def:{name:key, sector:defs[key].sector},
+      sectorOfSpace: Array.from({length:S}, (_,i)=> i>=18 && i<=26 ? 1 : 0),
+      sectorTok:["", "weather"] };
+}
+setWeather("heavy_rain");
+
+/* the wrapped step functions (fpview.js wraps these on load, like the game) */
+function playerReveal(){} function playerReact(){} function playerSlipstream(){}
+function playerCornerCheck(){} function playerDiscard(){} function playerReplenish(){}
+function endRound(){} function raceOver(){}
+function payHeat(p,n){ p.engine=Math.max(0,p.engine-n); }
+function weatherSpinOut(p){ p.total=Math.max(0,p.total-3); p._v.spin=360; p.gear=1; }
+function applyGravel(p){ if(trackHasGravel() && onGravel(p) && p.engine>0) payHeat(p,1); }
+
+/* ================= driver-sim ============================================= */
+var demo = false, last = performance.now();
+function play(n){ you.speed=n; you.total += n; }
+async function pause(ms){ return new Promise(r=>setTimeout(r,ms)); }
+async function settle(){ while(Math.abs(you._v.total-you.total)>0.02 || you._v.spin>1) await pause(60); }
+async function fullTurn(){
+  playerReveal();  you.engine=Math.max(you.engine,5);
+  await pause(700);
+  play(8);                 await settle();
+  playerReact();  you.total+=3; you.speed+=3;  await settle();
+  playerSlipstream(); you.total+=2;            await settle();
+  playerCornerCheck();
+  payHeat(you, 2);
+  await pause(900);
+  playerDiscard();
+  you.speed=0;
+}
+async function doSpin(){
+  playerReveal(); await pause(500);
+  play(10); await settle();
+  playerCornerCheck(); weatherSpinOut(you);
+  await settle(); await pause(600); playerDiscard(); you.speed=0;
+}
+async function doGravel(){
+  playerReveal(); await pause(400);
+  you.total = 4; you._v.total = 3; you.spot = 0;   // roll onto inner gravel at 5
+  play(1); await settle();
+  applyGravel(you);
+  await pause(900); playerDiscard(); you.speed=0;
+}
+(function step(now){
+  requestAnimationFrame(step);
+  const dt = Math.min(.06, (now-last)/1000); last = now;
+  const v = you._v, rem = you.total - v.total;
+  if(rem > 0)      v.total = Math.min(you.total, v.total + Math.min(15, 2.4+rem*3.4)*dt);
+  else if(rem < 0) v.total = Math.max(you.total, v.total - 14*dt);
+  if(v.spin > 0)   v.spin = Math.max(0, v.spin - 560*dt);
+  for(const b of bots){
+    b._v.total += b.pace*dt; b.total = Math.floor(b._v.total);
+    if(Math.random()<0.002) b._v.off = -b._v.off;
+  }
+  if(demo && Math.abs(rem) < .01 && Math.random() < 0.006) fullTurn();
+})(last);
+</script>
+
+<!-- the module under test — the very same file the game will load -->
+<script src="js/fpview.js"></script>
+</body>
+</html>
